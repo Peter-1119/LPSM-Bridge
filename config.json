@@ -1,0 +1,9 @@
+{
+    "camera_mapping": {
+        "172.23.128.100": "CAMERA_LEFT_1",
+        "172.23.128.101": "CAMERA_LEFT_2",
+        "172.23.128.102": "CAMERA_RIGHT_1",
+        "172.23.128.103": "CAMERA_RIGHT_2"
+    }
+
+}
