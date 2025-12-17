@@ -1,4 +1,3 @@
-```Markdown
 # ControlHub (LPSM-Bridge)
 
 [![C++ Standard](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://isocpp.org/)
@@ -31,7 +30,6 @@
                              | StateManager   | <-------> | WebSocket Srv  |
                              | (JSONL Store)  |           | (uWebSockets)  |
                              +----------------+           +----------------+
-```
 
 ## ✨ 核心功能 (Features)
 * **⚡ 高效能非同步 I/O：使用 `Boost.Asio` 處理 PLC 與相機連線，確保高併發下的低延遲。**
