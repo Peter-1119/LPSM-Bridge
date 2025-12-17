@@ -11,7 +11,7 @@
 ## 🏗 系統架構 (Architecture)
 
 系統運作於 Windows 環境，透過多執行緒處理不同的硬體 I/O，並統一透過 MessageBus 匯聚資訊。
-```
+```Markdown
 [ Hardware Layer ]        [ Middleware (C++) ]          [ Presentation Layer ]
 +----------------+       +----------------------+       +--------------------+
 | Barcode Scanner| --->  | Keyboard Hook (Win32)| --+-> |                    |
