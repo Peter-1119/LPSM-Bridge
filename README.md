@@ -57,33 +57,31 @@
 * zlib, libuv (uWebSockets 依賴)
 
 ### 編譯步驟
-    ```Bash
-    mkdir build
-    cd build
-    cmake -G "MinGW Makefiles" ..
-    cmake --build .
-    ```
+```Bash
+mkdir build
+cd build
+cmake -G "MinGW Makefiles" ..
+cmake --build .
+```
 
 ### 執行
 請確保 `config.json` 位於執行檔同級目錄下。
-
-    ```Bash
-    ./lpsm_app.exe
-    ```
+```Bash
+./lpsm_app.exe
+```
 
 ### ⚙️ 設定檔 (Configuration)
 `config.json` 用於定義網路相機 IP 與識別名稱的映射關係。
-
-    ```JSON
-    {
-        "camera_mapping": {
-            "172.23.128.100": "CAMERA_LEFT_1",
-            "172.23.128.101": "CAMERA_LEFT_2",
-            "172.23.128.102": "CAMERA_RIGHT_1",
-            "172.23.128.103": "CAMERA_RIGHT_2"
-        }
+```JSON
+{
+    "camera_mapping": {
+        "172.23.128.100": "CAMERA_LEFT_1",
+        "172.23.128.101": "CAMERA_LEFT_2",
+        "172.23.128.102": "CAMERA_RIGHT_1",
+        "172.23.128.103": "CAMERA_RIGHT_2"
     }
-    ```
+}
+```
 
 ### 📡 通訊協議 (Communication Protocol)
 後端運作於 WebSocket `ws://0.0.0.0:8181`。
