@@ -30,13 +30,13 @@
 
 ```mermaid
 graph TD
-    DB[(MySQL Database)]
-    Frontend(Vue.js Frontend)
+    DB[("MySQL Database")]
+    Frontend("Vue.js Frontend")
     
     subgraph "ControlHub (C++ Backend)"
         Config[Config Loader]
-        PlcDriver[PLC Client (Asio)]
-        CamDriver[Cam Server (Asio)]
+        PlcDriver["PLC Client (Asio)"]
+        CamDriver["Cam Server (Asio)"]
         Hook[Keyboard Hook]
         WS[WebSocket Server]
         Bus[MessageBus]
@@ -134,10 +134,10 @@ cmake --build .
 1. 環境檢查: 確保本機 IP 已註冊在資料庫的 2did_machine_config 表中。
 2. 啟動程式: 執行 lpsm_app.exe。
 3. 啟動流程:
-  * [System] 清理舊的 Chrome 與 Port 佔用 (8181, 6060)。
-  * [Config] 偵測本機 IP -> 連線 DB 下載設定。
-  * [Browser] 自動開啟 Chrome 至 `http://10.8.32.64:2102/` (可於 main.cpp 修改)。
-  * [Services] 啟動 WebSocket, PLC Client, Cam Server, Keyboard Hook。
+  - [System] 清理舊的 Chrome 與 Port 佔用 (8181, 6060)。
+  - [Config] 偵測本機 IP -> 連線 DB 下載設定。
+  - [Browser] 自動開啟 Chrome 至 `http://10.8.32.64:2102/` (可於 main.cpp 修改)。
+  - [Services] 啟動 WebSocket, PLC Client, Cam Server, Keyboard Hook。
 4. 關閉程式: 點擊 Console 視窗右上角的 `[X]` 即可安全退出。
 
 ---
