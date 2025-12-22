@@ -7,8 +7,8 @@
 #include <cstdlib> 
 #include <atomic>
 #include <csignal>
+#include <boost/asio.hpp> 
 
-// 引入您自定義的標頭檔
 #include "core/Logger.hpp"
 #include "core/MessageBus.hpp"
 #include "core/Config.hpp"
@@ -21,21 +21,13 @@
 // 全域變數
 std::atomic<bool> g_running{true};
 
-// ---------------------------------------------------------
-// 1. 強制殺死佔用 Port 的殭屍行程
-// ---------------------------------------------------------
 void KillProcessOnPort(int port) {
     std::string cmd = "for /f \"tokens=5\" %a in ('netstat -aon ^| find \":" + std::to_string(port) + "\" ^| find \"LISTENING\"') do taskkill /f /pid %a > nul 2>&1";
     system(cmd.c_str());
 }
 
-// ---------------------------------------------------------
-// 2. 攔截右上角 X 與 Ctrl+C 訊號
-// ---------------------------------------------------------
 BOOL WINAPI ConsoleHandler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT || signal == CTRL_BREAK_EVENT) {
-        // ✅ [修正] 移除 Sleep，讓反應更即時
-        // 我們只設定旗標，剩下的交給主迴圈的 TerminateProcess 處理
         g_running = false;
         return TRUE; 
     }
@@ -51,80 +43,86 @@ void OpenChromeOnWindows(std::string url) {
     #endif
 }
 
+std::string GetLocalIP() {
+    try {
+        boost::asio::io_context io_context;
+        boost::asio::ip::udp::resolver resolver(io_context);
+        boost::asio::ip::udp::socket socket(io_context);
+        
+        // ✅ [修正] 使用 make_address 替代 from_string
+        socket.connect(boost::asio::ip::udp::endpoint(boost::asio::ip::make_address("8.8.8.8"), 53));
+        
+        return socket.local_endpoint().address().to_string();
+    } catch (std::exception& e) {
+        spdlog::error("Failed to get local IP: {}", e.what());
+        return "127.0.0.1"; 
+    }
+}
+
 int main() {
-    // 1. 設定編碼
     SetConsoleOutputCP(65001);
 
-    // 2. 清理舊的殭屍 (包含殺死 Chrome，這很重要，確保環境乾淨)
-    // 建議加入殺死 chrome 的指令，避免舊的 Chrome 還是卡著 port
-    system("taskkill /F /IM chrome.exe >nul 2>&1"); 
+    // 1. 環境清理 (包含關閉殘留的 Chrome)
+    system("taskkill /F /IM chrome.exe >nul 2>&1");
     KillProcessOnPort(8181); 
     KillProcessOnPort(6060); 
     
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
-    // ✅ [關鍵修改] 3. 在任何 Socket 建立之前，先開啟網頁！
-    // 這樣 Chrome 啟動時，我們手上還沒有任何 Socket，它就無法繼承，也不會卡住 Port。
+    // 2. 開啟網頁 (請確認現場是否連得到這個 IP)
     OpenChromeOnWindows("http://10.8.32.64:2102/");
     
-    // 給瀏覽器一點時間啟動
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    // 給瀏覽器足夠時間啟動，避免 Port 搶佔問題
+    std::this_thread::sleep_for(std::chrono::milliseconds(3000));
 
-    // 4. 註冊關閉處理
     if (!SetConsoleCtrlHandler(ConsoleHandler, TRUE)) {
         std::cerr << "錯誤: 無法註冊控制台處理程序" << std::endl;
     }
 
-    // 5. 初始化與 Socket 建立 (現在執行這些是安全的)
     Logger::init();
-    Config::load();
+
+    // 3. 取得本機 IP 並載入設定
+    std::string my_ip = GetLocalIP();
+    spdlog::info("Detected Local IP: {}", my_ip);
+
+    if (!Config::load_from_db(my_ip)) {
+        spdlog::error("❌ 無法從資料庫載入設定！可能是 IP 未註冊或 DB 連線失敗。");
+        spdlog::error("程式將在 10 秒後退出...");
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        return -1; // 強制結束
+    }
+
     spdlog::info("LPSM System Starting...");
     
     auto bus = std::make_shared<MessageBus>();
     boost::asio::io_context ioc; 
 
-    // 這些物件內部會建立 Socket，現在 Chrome 已經開好了，不會影響這些新 Socket
+    // 4. 使用動態 IP 建立元件
     auto plc = std::make_shared<PlcClient>(ioc, bus, Config::get().plc_ip, Config::get().plc_port);
     auto cam = std::make_shared<CamServer>(ioc, bus, 6060);
     auto ws_server = std::make_shared<WsServer>(bus);
     auto controller = std::make_shared<Controller>(bus, plc, ws_server);
 
+    // 5. 啟動所有執行緒
     plc->start();
     std::thread io_thread([&ioc](){ 
         auto work = boost::asio::make_work_guard(ioc);
         ioc.run(); 
     });
 
-    // 5. 啟動全域鍵盤監聽
     KeyboardHook scanner_hook(bus);
     scanner_hook.start();
 
-    // 給瀏覽器一點時間啟動
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-
-    spdlog::info("LPSM System Started.");
-    spdlog::info("--------------------------------------------------");
-    spdlog::info("系統已就緒。現場人員可直接按右上角 [X] 關閉程式。");
-    spdlog::info("--------------------------------------------------");
-
-    // 啟動執行緒 (Socket 在這裡才真正被 bind)
     std::thread logic_thread([controller](){ controller->run(); });
-    std::thread ws_thread([ws_server](){ ws_server->run(8181); }); // 這裡才佔用 8181
+    std::thread ws_thread([ws_server](){ ws_server->run(8181); });
 
-    // 6. 主迴圈：等待 g_running 變為 false (當按下 X 時)
+    spdlog::info("LPSM System Started. Press [X] to exit.");
+
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    // 7. 退出前的清理
-    // 這裡我們只做個紀錄，不再嘗試停止 boost/ws，因為可能會卡住
     spdlog::info("[System] Stopping services and exiting...");
-    
-    // ✅ [修正 2] 核彈級退出：TerminateProcess
-    // 解決「按 X 卡住」、「需要按兩次」的問題。
-    // 這會直接告訴作業系統：立刻、馬上把這個 Process 從記憶體抹除。
-    // 因為我們開機時有 KillProcessOnPort 保護，所以這裡暴力退出是安全的。
     TerminateProcess(GetCurrentProcess(), 0);
-
     return 0;
 }

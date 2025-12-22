@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <boost/asio.hpp>
 #include <vector>
 #include "core/MessageBus.hpp"
@@ -15,15 +16,28 @@ private:
     boost::asio::steady_timer timer_;
     bool connected_ = false;
 
-    // 定義要讀取的點位映射 (根據 Python 的 db_json_str)
-    // 假設: M503(up_in), M506(up_out), M542(dn_in), M545(dn_out), M630(start)
-    // 這些地址需要換算成整數: M503 -> 503
-    const int ADDR_START = 500; 
-    const int ADDR_COUNT = 150; // 一次讀取 M500 ~ M650
+    int start_addr_ = 0;
+    int read_count_ = 0;
 
 public:
     PlcClient(boost::asio::io_context& ioc, std::shared_ptr<MessageBus> bus, std::string ip, int port) : ioc_(ioc), socket_(ioc), bus_(bus), timer_(ioc) {
+        
         endpoint_ = tcp::endpoint(boost::asio::ip::make_address(ip), port);
+        
+        // ✅ 自動計算讀取範圍
+        auto& pts = Config::get().points;
+        int min_addr = std::min({pts.up_in, pts.up_out, pts.dn_in, pts.dn_out, pts.start});
+        int max_addr = std::max({pts.up_in, pts.up_out, pts.dn_in, pts.dn_out, pts.start});
+        
+        // 設定起始位置為 最小值的整百位 (例如 503 -> 500)，確保涵蓋範圍
+        start_addr_ = (min_addr / 100) * 100;
+        
+        // 計算需要的長度 (多抓一點 buffer，例如到 max_addr 後面 + 16 點)
+        // 注意：一次讀取不能超過 PLC 上限 (通常 960點/bit)，這裡設安全值
+        int needed = max_addr - start_addr_ + 20; 
+        read_count_ = (needed < 100) ? 100 : needed; // 至少讀 100 點
+        
+        spdlog::info("[PLC] Auto-Range: Start M{}, Count {}", start_addr_, read_count_);
     }
 
     void start() { do_connect(); }
@@ -82,8 +96,10 @@ private:
     }
 
     void do_poll_loop() {
-        auto packet = build_read_packet(ADDR_START, ADDR_COUNT);
+        // ✅ 使用 start_addr_ 和 read_count_
+        auto packet = build_read_packet(start_addr_, read_count_); 
         auto buf = std::make_shared<std::vector<uint8_t>>(packet);
+        
         boost::asio::async_write(socket_, boost::asio::buffer(*buf),
             [this, buf](boost::system::error_code ec, std::size_t) {
                 if (!ec) do_read_response();
@@ -96,12 +112,11 @@ private:
         socket_.async_read_some(boost::asio::buffer(*buf),
             [this, buf](boost::system::error_code ec, std::size_t len) {
                 if (!ec && len > 11) {
-                    // 解析 binary payload (Bit data starts at offset 11)
-                    // 這裡簡化處理：直接把 Raw Data 丟給 Controller 解析
                     std::vector<uint8_t> data(buf->begin() + 11, buf->begin() + len);
-                    bus_->push({"PLC", "STATUS", json{{"raw", data}, {"start_addr", ADDR_START}}});
+                    // ✅ 傳送當前的 start_addr_ 給 Controller 解析
+                    bus_->push({"PLC", "STATUS", json{{"raw", data}, {"start_addr", start_addr_}}});
                     
-                    timer_.expires_after(std::chrono::milliseconds(200)); // 200ms Poll
+                    timer_.expires_after(std::chrono::milliseconds(200));
                     timer_.async_wait([this](boost::system::error_code){ do_poll_loop(); });
                 }
             });

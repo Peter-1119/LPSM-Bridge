@@ -74,11 +74,36 @@ private:
     // 處理 PLC 訊號 -> 判斷是否變更 -> 廣播 & Log
     void handle_plc_update(const json& payload) {
         auto raw = payload["raw"].get<std::vector<uint8_t>>();
-        bool up_in  = (raw[0] >> 3) & 1;
-        bool up_out = (raw[0] >> 6) & 1;
-        bool dn_in  = (raw[5] >> 2) & 1;
-        bool dn_out = (raw[5] >> 5) & 1;
-        bool start  = (raw[16] >> 2) & 1;
+        int base_addr = payload["start_addr"].get<int>(); // 例如 500
+        auto& pts = Config::get().points;
+
+        // ✅ 通用 Bit 解析函式
+        auto get_bit = [&](int target_addr) {
+            int offset = target_addr - base_addr; // 計算偏移 (例如 503 - 500 = 3)
+            
+            if (offset < 0) return false; // 異常
+            int byte_idx = offset / 8;    // 第幾個 Byte (3 / 8 = 0)
+            int bit_idx = offset % 8;     // 第幾個 Bit (3 % 8 = 3)
+            
+            // 如果 Byte 超出範圍
+            if (byte_idx >= raw.size()) return false;
+
+            // Mitsubishi 3E Frame Bit Order check:
+            // 通常 Low Bit 在前，如果有問題可能需要改 (0x01 << bit_idx)
+            // (raw[byte_idx] >> 4) & 1  <-- Mitsubishi 常常是 High/Low nibble 問題，
+            // 但標準 MC Protocol 1 bit read 是依序排列。
+            // 這裡假設: Byte 0 = M500~M507 (M500 is bit 0? or bit 7?)
+            // 根據經驗，MC Protocol binary 16 bit mode:
+            // bit 0 = M500, bit 1 = M501... 
+            return (bool)((raw[byte_idx] >> bit_idx) & 1);
+        };
+
+        // 使用 DB 設定的點位來取值
+        bool up_in  = get_bit(pts.up_in);
+        bool up_out = get_bit(pts.up_out);
+        bool dn_in  = get_bit(pts.dn_in);
+        bool dn_out = get_bit(pts.dn_out);
+        bool start  = get_bit(pts.start);
 
         json plc_data = {
             {"up_in", up_in ? 1 : 0},
@@ -112,7 +137,7 @@ private:
 
         if (command == "GO_NOGO") {
             int val = cmd.value("payload", 0);
-            plc_->write_bit(86, val == 1);
+            plc_->write_bit(Config::get().points.go_nogo, val == 1);
         }
         else if (command == "STEP_UPDATE") {
             // 純 Log 或者是未來擴充用
