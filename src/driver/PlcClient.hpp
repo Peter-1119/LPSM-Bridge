@@ -22,8 +22,7 @@ private:
     const int ADDR_COUNT = 150; // 一次讀取 M500 ~ M650
 
 public:
-    PlcClient(boost::asio::io_context& ioc, std::shared_ptr<MessageBus> bus, std::string ip, int port)
-        : ioc_(ioc), socket_(ioc), bus_(bus), timer_(ioc) {
+    PlcClient(boost::asio::io_context& ioc, std::shared_ptr<MessageBus> bus, std::string ip, int port) : ioc_(ioc), socket_(ioc), bus_(bus), timer_(ioc) {
         endpoint_ = tcp::endpoint(boost::asio::ip::make_address(ip), port);
     }
 

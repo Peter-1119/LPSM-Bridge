@@ -69,8 +69,7 @@ public:
             if (file.is_open()) {
                 json log_evt = event;
                 if (!log_evt.contains("ts")) {
-                    log_evt["ts"] = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    log_evt["ts"] = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
                 }
                 file << log_evt.dump() << "\n";
             }

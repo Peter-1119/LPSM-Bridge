@@ -1,5 +1,6 @@
 #include <iostream>
 #include <thread>
+#include <string>
 
 // 引入您自定義的標頭檔
 #include "core/Logger.hpp"
@@ -12,7 +13,25 @@
 #include "server/WsServer.hpp"
 #include "logic/Controller.hpp"
 
-// 移除原本的 keyboard_loop，因為它會卡住 Console 且需要 Focus
+#ifdef _WIN32
+    #define WIN32_LEAN_AND_MEAN
+    #include <windows.h>
+    #include <shellapi.h>
+#endif
+
+// 上位機 10.8.142.192@myuser no password
+
+void OpenChromeOnWindows(std::string url) {
+    std::string command;
+    #ifdef _WIN32
+        ShellExecuteA(NULL, "open", "chrome.exe", url.c_str(), NULL, SW_SHOW);
+    
+    #else
+        std::cout << "無法自動開啟 Chrome 此功能僅支援 Windows" << std::endl;
+        return;
+
+    #endif
+}
 
 int main() {
     // 1. 初始化
@@ -48,6 +67,7 @@ int main() {
     // 5. ✅ 啟動全域鍵盤監聽 (Hook)
     KeyboardHook scanner_hook(bus);
     scanner_hook.start();
+    OpenChromeOnWindows("http://localhost:5173/");
 
     spdlog::info("LPSM System Started. Scanner Hook Active.");
     spdlog::info("You can scan barcodes even if this window is not focused.");

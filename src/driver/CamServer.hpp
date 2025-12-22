@@ -14,9 +14,7 @@ class CamSession : public std::enable_shared_from_this<CamSession> {
     std::string client_id_;
 
 public:
-    CamSession(tcp::socket socket, std::shared_ptr<MessageBus> bus, boost::asio::io_context& ioc)
-        : socket_(std::move(socket)), bus_(bus), timeout_timer_(ioc) {
-            
+    CamSession(tcp::socket socket, std::shared_ptr<MessageBus> bus, boost::asio::io_context& ioc) : socket_(std::move(socket)), bus_(bus), timeout_timer_(ioc) {
         // ✅ [關鍵] 取得 IP 並映射到 Config 中的名稱 (e.g. CAMERA_LEFT_1)
         try {
             std::string ip = socket_.remote_endpoint().address().to_string();
@@ -44,34 +42,33 @@ public:
 private:
     void do_read() {
         auto self(shared_from_this());
-        socket_.async_read_some(boost::asio::buffer(data_),
-            [this, self](boost::system::error_code ec, std::size_t length) {
-                if (!ec) {
-                    std::string barcode(data_, length);
-                    // 移除換行符
-                    barcode.erase(std::remove(barcode.begin(), barcode.end(), '\n'), barcode.end());
-                    barcode.erase(std::remove(barcode.begin(), barcode.end(), '\r'), barcode.end());
-                    
-                    if (!barcode.empty()) {
-                        spdlog::info("[CAM] {} Recv: {}", client_id_, barcode);
-                        // ✅ 直接送字串，Controller 不用處理，WsServer 會自動轉發給前端
-                        bus_->push({ client_id_, "BARCODE", barcode });
-                    }
-                    
-                    reset_timeout();
-                    do_read();
+        socket_.async_read_some(boost::asio::buffer(data_), [this, self](boost::system::error_code ec, std::size_t length) {
+            if (!ec) {
+                std::string barcode(data_, length);
+                // 移除換行符
+                barcode.erase(std::remove(barcode.begin(), barcode.end(), '\n'), barcode.end());
+                barcode.erase(std::remove(barcode.begin(), barcode.end(), '\r'), barcode.end());
+                
+                if (!barcode.empty()) {
+                    spdlog::info("[CAM] {} Recv: {}", client_id_, barcode);
+                    // ✅ 直接送字串，Controller 不用處理，WsServer 會自動轉發給前端
+                    bus_->push({ client_id_, "BARCODE", barcode });
                 }
-            });
+                
+                reset_timeout();
+                do_read();
+            }
+        });
     }
 
     void reset_timeout() {
-        timeout_timer_.expires_after(std::chrono::seconds(3));
+        timeout_timer_.expires_after(std::chrono::seconds(1));
         timeout_timer_.async_wait([this, self=shared_from_this()](boost::system::error_code ec){
             if (!ec) {
-                // Timeout 發送 TIMEOUT_BLANK
-                // 前端會根據這個訊號清除畫面
+                // Send timeout signal
                 bus_->push({ client_id_ + "_MONITOR", "TIMEOUT", "TIMEOUT_BLANK" });
-                // 這裡不斷線，只是發訊號，繼續等下一次資料
+                // Start timer again
+                reset_timeout();
             }
         });
     }
@@ -83,8 +80,7 @@ class CamServer {
     std::shared_ptr<MessageBus> bus_;
 
 public:
-    CamServer(boost::asio::io_context& ioc, std::shared_ptr<MessageBus> bus, int port)
-        : ioc_(ioc), acceptor_(ioc, tcp::endpoint(tcp::v4(), port)), bus_(bus) {
+    CamServer(boost::asio::io_context& ioc, std::shared_ptr<MessageBus> bus, int port) : ioc_(ioc), acceptor_(ioc, tcp::endpoint(tcp::v4(), port)), bus_(bus) {
         do_accept();
     }
 

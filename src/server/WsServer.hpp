@@ -11,35 +11,45 @@ class WsServer {
     std::shared_ptr<MessageBus> bus_;
     struct PerSocketData {}; 
     std::atomic<bool> running_{true};
-    uWS::App* app_ptr = nullptr; // 儲存 App 指標以便廣播
+    
+    // ✅ 儲存 uWS 的 Loop 指標，用來做跨執行緒排程
+    uWS::Loop *loop_ = nullptr;
+    uWS::App* app_ptr = nullptr;
 
 public:
     WsServer(std::shared_ptr<MessageBus> bus) : bus_(bus) {}
 
-    // ✅ 新增公開廣播介面
+    // ✅ 修改後的廣播介面：使用 defer 將任務丟回 WS 執行緒
     void broadcast(const std::string& message) {
-        if (app_ptr) {
-            // uWS::App::publish 是 thread-safe 的
-            app_ptr->publish("broadcast", message, uWS::OpCode::TEXT, false);
-            spdlog::info("[WS] SEND Broadcast: {}", message);
+        // 必須檢查 loop_ 是否存在 (Server 啟動後才有)
+        if (loop_ && app_ptr) {
+            // copy message (因為是非同步執行，必須複製一份字串)
+            // defer 會讓這個 lambda 在 WS 執行緒的安全時間點執行
+            loop_->defer([this, msg = message]() {
+                if (app_ptr) {
+                    app_ptr->publish("broadcast", msg, uWS::OpCode::TEXT, false);
+                    spdlog::info("[WS] SEND Broadcast: {}", msg);
+                }
+            });
         }
     }
 
     void run(int port) {
-        uWS::App app;
-        app_ptr = &app; // 儲存指標
+        // ✅ 1. 獲取當前執行緒的 Event Loop
+        // 注意：這行必須在 run 的這個執行緒內呼叫
+        loop_ = uWS::Loop::get();
 
-        // 1. Heartbeat 生產者 (維持原樣)
+        uWS::App app;
+        app_ptr = &app;
+
         std::thread hb_thread([this](){
             while(running_) {
                 std::this_thread::sleep_for(std::chrono::seconds(2));
+                // 這裡只負責推 Event 到 Bus，不直接廣播，所以是安全的
                 bus_->push({"SYS", "HEARTBEAT", json{{"ts", std::time(nullptr)}}});
             }
         });
 
-        // ❌ 移除 broadcast_thread，不再跟 Controller 搶訊息
-
-        // 2. uWebSockets Server
         app.ws<PerSocketData>("/*", {
             .open = [](auto *ws) {
                 ws->subscribe("broadcast"); 
@@ -49,10 +59,11 @@ public:
             },
             .message = [this](auto *ws, std::string_view message, uWS::OpCode opCode) {
                 std::string msg_str(message);
-                spdlog::info("[WS] RECV: {}", msg_str);
+                // spdlog::info("[WS] RECV: {}", msg_str); // 怕太吵可以註解掉
                 try {
                     auto j = json::parse(message);
                     if (j.contains("command") && j["command"] == "HEARTBEAT") {
+                        // 回傳 ACK
                         json ack = {{"type", "control"}, {"command", "HEARTBEAT_ACK"}, {"payload", {{"server_ts", std::time(nullptr) * 1000}, {"client_ts", j["payload"].value("ts", 0)}}}};
                         ws->send(ack.dump(), uWS::OpCode::TEXT, false);
                         return; 
@@ -68,8 +79,11 @@ public:
             else spdlog::error("[WS] FAILED to listen on port {}!", port);
         }).run();
 
+        // 結束時清理
         running_ = false;
         app_ptr = nullptr;
+        loop_ = nullptr; // ✅ 清空 Loop 指標
+        
         if(hb_thread.joinable()) hb_thread.join();
     }
 };
