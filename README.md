@@ -32,6 +32,9 @@
 graph TD
     DB[("MySQL Database")]
     Frontend("Vue.js Frontend")
+    PLC["Mitsubishi PLC"]
+    Camera["Industrial Cameras"]
+    Scanner["Barcode Scanner"]
     
     subgraph "ControlHub (C++ Backend)"
         Config[Config Loader]
@@ -42,17 +45,17 @@ graph TD
         Bus[MessageBus]
     end
 
-    Config <-- "Load Config by Local IP" --> DB
-    PlcDriver <--> "MC Protocol" <--> PLC[Mitsubishi PLC]
-    CamDriver <--> "TCP/IP" <--> Camera[Industrial Cameras]
-    Hook <--> "USB HID" <--> Scanner[Barcode Scanner]
+    Config <--"Load Config by Local IP"--> DB
+    PlcDriver <--"MC Protocol"--> PLC
+    CamDriver <--"TCP/IP"--> Camera
+    Hook <--"USB HID"--> Scanner
     
     PlcDriver --> Bus
     CamDriver --> Bus
     Hook --> Bus
     
     Bus --> WS
-    WS <--> "Real-time Events (Port 8181)" <--> Frontend
+    WS <--"Real-time Events (Port 8181)"--> Frontend
 ```
 
 ---
