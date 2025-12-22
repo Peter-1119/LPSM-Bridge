@@ -62,7 +62,7 @@ private:
     }
 
     void reset_timeout() {
-        timeout_timer_.expires_after(std::chrono::seconds(1));
+        timeout_timer_.expires_after(std::chrono::seconds(60));
         timeout_timer_.async_wait([this, self=shared_from_this()](boost::system::error_code ec){
             if (!ec) {
                 // Send timeout signal

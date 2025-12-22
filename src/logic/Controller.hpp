@@ -1,7 +1,6 @@
 #pragma once
 #include <memory>
 #include "core/MessageBus.hpp"
-#include "core/StateManager.hpp"
 #include "driver/PlcClient.hpp"
 #include "core/Config.hpp"
 #include "server/WsServer.hpp"
@@ -9,13 +8,17 @@
 class Controller {
 private:
     std::shared_ptr<MessageBus> bus_;
-    std::shared_ptr<StateManager> state_;
     std::shared_ptr<PlcClient> plc_;
     std::shared_ptr<WsServer> ws_server_;
 
+    // ✅ 新增：紀錄上一次的 PLC 狀態與 Log 時間
+    json last_plc_state_;
+    std::chrono::steady_clock::time_point last_log_time_;
+
 public:
-    Controller(std::shared_ptr<MessageBus> bus, std::shared_ptr<StateManager> state, std::shared_ptr<PlcClient> plc, std::shared_ptr<WsServer> ws)
-        : bus_(bus), state_(state), plc_(plc), ws_server_(ws) {}
+    Controller(std::shared_ptr<MessageBus> bus, std::shared_ptr<PlcClient> plc, std::shared_ptr<WsServer> ws) : bus_(bus), plc_(plc), ws_server_(ws) {
+        last_log_time_ = std::chrono::steady_clock::now();
+    }
 
     void run() {
         Message msg;
@@ -31,8 +34,6 @@ public:
                 }
                 // 3. 掃碼槍輸入 (純轉發，邏輯在前端)
                 else if (msg.source == "SCANNER") {
-                    // 這裡其實不需要做什麼，因為下面的廣播邏輯會處理
-                    // 但為了 debug，我們留個 log
                     spdlog::info("[Controller] Scanner Input Triggered");
                 }
 
@@ -41,21 +42,20 @@ public:
                 bool should_broadcast = (
                     msg.source == "SYS" || 
                     msg.source == "WS" || 
-                    msg.source == "PLC_MONITOR" || 
+                    // msg.source == "PLC_MONITOR" || // ⚠️ 修改：PLC 改由 handle_plc_update 內部控制廣播
                     msg.source == "SCANNER" ||
-                    msg.source.rfind("CAMERA", 0) == 0 // 所有 CAMERA 開頭的都轉發
+                    msg.source.rfind("CAMERA", 0) == 0 
                 );
 
                 if (should_broadcast) {
                     json wrapper;
                     if (msg.type == "HEARTBEAT") {
-                        if (msg.source == "SYS") continue; // 內部心跳不廣播
+                        if (msg.source == "SYS") continue; 
                     } 
                     else if (msg.type == "STATE_SYNC") {
                         wrapper = {{"type", "control"}, {"command", "STATE_SYNC"}, {"payload", msg.payload}};
                     }
                     else {
-                        // 預設為 data 類型 (給前端 processControl / handleInfoInput 用)
                         wrapper = {{"type", "data"}, {"source", msg.source}, {"payload", msg.payload}};
                     }
                     
@@ -71,10 +71,9 @@ public:
     }
 
 private:
-    // 處理 PLC 訊號 -> 更新記憶體 -> 準備廣播
+    // 處理 PLC 訊號 -> 判斷是否變更 -> 廣播 & Log
     void handle_plc_update(const json& payload) {
         auto raw = payload["raw"].get<std::vector<uint8_t>>();
-        
         bool up_in  = (raw[0] >> 3) & 1;
         bool up_out = (raw[0] >> 6) & 1;
         bool dn_in  = (raw[5] >> 2) & 1;
@@ -89,39 +88,36 @@ private:
             {"start_message", start ? 1 : 0}
         };
 
-        // 更新後端記憶體 (以備前端 F5 重整時查詢)
-        state_->update_plc_memory(plc_data);
-        
-        // 推入 Bus，讓 run() loop 中的廣播邏輯處理
-        bus_->push({"PLC_MONITOR", "DATA", plc_data});
+        // ✅ 優化 1: 只有狀態「變更」時才廣播給前端 (減少網路與 Log 垃圾)
+        if (plc_data != last_plc_state_) {
+            spdlog::info("[PLC] Status Changed: {}", plc_data.dump());
+            
+            // 手動觸發廣播 (因為 run() loop 裡把 PLC_MONITOR 的自動廣播關了)
+            json wrapper = {{"type", "data"}, {"source", "PLC_MONITOR"}, {"payload", plc_data}};
+            ws_server_->broadcast(wrapper.dump());
+            
+            last_plc_state_ = plc_data;
+        }
+
+        // ✅ 優化 2: 每 5 秒在 Terminal 顯示一次狀態 (Heartbeat Log)
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time_).count() >= 5) {
+            spdlog::info("[PLC] Monitor (5s): {}", plc_data.dump());
+            last_log_time_ = now;
+        }
     }
 
     void handle_ws_command(const json& cmd) {
         std::string command = cmd.value("command", "");
-        
-        if (command == "LOAD_STATE") {
-            // 只有這裡會主動發送 STATE_SYNC
-            bus_->push({"SYS", "STATE_SYNC", state_->get_copy()});
-        }
-        else if (command == "GO_NOGO") {
+
+        if (command == "GO_NOGO") {
             int val = cmd.value("payload", 0);
             plc_->write_bit(86, val == 1);
         }
-        else if (command == "STATE_PATCH") {
-            // 前端通知狀態變更 -> 寫入後端 DB (Persistence)
-            // 這裡完全不廣播，因為前端自己知道
-            auto payload = cmd["payload"];
-            if (payload.contains("events") && payload["events"].is_array()) {
-                for (const auto& evt : payload["events"]) {
-                    state_->apply_patch(evt);
-                }
-            }
-        }
         else if (command == "STEP_UPDATE") {
-            // 純粹給後端更新記憶體中的 Stage (如果需要的話)
-            // 不做任何廣播
+            // 純 Log 或者是未來擴充用
             std::string step = cmd.value("payload", "");
-            // state_->update_and_log("SET", "stage", step); // 其實連這行也可以不用，因為 STATE_PATCH 會做
+            spdlog::info("[Controller] Step updated to: {}", step);
         }
     }
 };
