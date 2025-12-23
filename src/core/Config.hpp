@@ -20,7 +20,9 @@ public:
         int dn_in = 542;
         int dn_out = 545;
         int start = 630;
-        int go_nogo = 86;
+        // ✅ [修正] 拆分寫入點位
+        int write_result = 87;  // M87
+        int write_trigger = 86; // M86
     };
 
     struct AppConfig {
@@ -61,7 +63,7 @@ public:
         cfg.hub_ip = local_ip;
 
         // 1. 讀取 PLC 配置
-        std::string sql = "SELECT plc_ip, plc_port, addr_up_in, addr_up_out, addr_dn_in, addr_dn_out, addr_start, addr_go_nogo FROM 2did_machine_config WHERE hub_ip = '" + local_ip + "'";
+        std::string sql = "SELECT plc_ip, plc_port, addr_up_in, addr_up_out, addr_dn_in, addr_dn_out, addr_start, addr_write_result, addr_write_trigger FROM 2did_machine_config WHERE hub_ip = '" + local_ip + "'";
         if (mysql_query(con, sql.c_str()) == 0) {
             MYSQL_RES* res = mysql_store_result(con);
             if (MYSQL_ROW row = mysql_fetch_row(res)) {
@@ -72,7 +74,9 @@ public:
                 if(row[4]) cfg.points.dn_in = std::stoi(row[4]);
                 if(row[5]) cfg.points.dn_out = std::stoi(row[5]);
                 if(row[6]) cfg.points.start = std::stoi(row[6]);
-                if(row[7]) cfg.points.go_nogo = std::stoi(row[7]);
+                // ✅ [修正] 讀取 M87 和 M86
+                if(row[7]) cfg.points.write_result = std::stoi(row[7]);
+                if(row[8]) cfg.points.write_trigger = std::stoi(row[8]);
                 
                 spdlog::info("[Config] PLC Loaded from DB. PLC IP: {}, Port: {}", cfg.plc_ip, cfg.plc_port);
             } else {

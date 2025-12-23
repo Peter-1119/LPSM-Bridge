@@ -28,8 +28,31 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     spdlog::info("[Scanner] Detected: {}", g_barcode_buffer);
                     
                     if (g_bus_ref) {
-                        spdlog::info("[Broadcast] Keyboard Input: {}", g_barcode_buffer);
-                        g_bus_ref->push({"SCANNER", "DATA", g_barcode_buffer});
+                        if (g_barcode_buffer.compare("1") == 0) {
+                            spdlog::info("[Broadcast] Camera Test Input: 4240912013144");
+                            g_bus_ref->push({"CAMERA_LEFT_1", "DATA", "4240912013144"});
+                        }
+                        else if (g_barcode_buffer.compare("2") == 0) {
+                            spdlog::info("[Broadcast] Camera Test Input: 4240912012548");
+                            g_bus_ref->push({"CAMERA_RIGHT_1", "DATA", "4240912012548"});
+                        }
+                        else if (g_barcode_buffer.compare("3") == 0) {
+                            spdlog::info("[Broadcast] Camera Test Input: 4240913025717");
+                            g_bus_ref->push({"CAMERA_RIGHT_1", "DATA", "4240913025717"});
+                        }
+                        else if (g_barcode_buffer.compare("4") == 0) {
+                            spdlog::info("[Broadcast] Camera Test Input: 4240914001156");
+                            g_bus_ref->push({"CAMERA_RIGHT_2", "DATA", "4240914001156"});
+                        }
+                        else if (g_barcode_buffer.compare("0") == 0) {
+                            spdlog::info("[Broadcast] Camera Test Input: TIMEOUT_BLANK");
+                            g_bus_ref->push({"CAMERA_LEFT_GROUP_MONITOR", "DATA", "TIMEOUT_BLANK"});
+                            g_bus_ref->push({"CAMERA_RIGHT_GROUP_MONITOR", "DATA", "TIMEOUT_BLANK"});
+                        }
+                        else {
+                            spdlog::info("[Broadcast] Keyboard Input: {}", g_barcode_buffer);
+                            g_bus_ref->push({"SCANNER", "DATA", g_barcode_buffer});
+                        }
                     }
                     g_barcode_buffer.clear();
                 }

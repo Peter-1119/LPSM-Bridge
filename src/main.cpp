@@ -43,6 +43,17 @@ void OpenChromeOnWindows(std::string url) {
     #endif
 }
 
+// 修改原本的 OpenChromeOnWindows
+void OpenEdgeOnWindows(std::string url) {
+    #ifdef _WIN32
+        // 將 "chrome.exe" 改為 "msedge.exe"
+        ShellExecuteA(NULL, "open", "msedge.exe", url.c_str(), NULL, SW_SHOW);
+    #else
+        std::cout << "無法自動開啟 Edge 此功能僅支援 Windows" << std::endl;
+        return;
+    #endif
+}
+
 std::string GetLocalIP() {
     try {
         boost::asio::io_context io_context;
@@ -63,14 +74,15 @@ int main() {
     SetConsoleOutputCP(65001);
 
     // 1. 環境清理 (包含關閉殘留的 Chrome)
-    system("taskkill /F /IM chrome.exe >nul 2>&1");
+    system("taskkill /F /IM msedge.exe >nul 2>&1");
     KillProcessOnPort(8181); 
     KillProcessOnPort(6060); 
     
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
     // 2. 開啟網頁 (請確認現場是否連得到這個 IP)
-    OpenChromeOnWindows("http://10.8.32.64:2102/");
+    OpenEdgeOnWindows("http://10.8.32.64:2102/");
+    // OpenEdgeOnWindows("http://localhost:5173/");
     
     // 給瀏覽器足夠時間啟動，避免 Port 搶佔問題
     std::this_thread::sleep_for(std::chrono::milliseconds(3000));

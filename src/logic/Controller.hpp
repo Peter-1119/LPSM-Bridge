@@ -74,28 +74,29 @@ private:
     // 處理 PLC 訊號 -> 判斷是否變更 -> 廣播 & Log
     void handle_plc_update(const json& payload) {
         auto raw = payload["raw"].get<std::vector<uint8_t>>();
-        int base_addr = payload["start_addr"].get<int>(); // 例如 500
+        int base_addr = payload["start_addr"].get<int>();
         auto& pts = Config::get().points;
 
         // ✅ 通用 Bit 解析函式
         auto get_bit = [&](int target_addr) {
-            int offset = target_addr - base_addr; // 計算偏移 (例如 503 - 500 = 3)
+            int offset = target_addr - base_addr;
+            if (offset < 0) return false;
+
+            // 修正計算方式：除以 2 而不是 8
+            int byte_idx = offset / 2;
             
-            if (offset < 0) return false; // 異常
-            int byte_idx = offset / 8;    // 第幾個 Byte (3 / 8 = 0)
-            int bit_idx = offset % 8;     // 第幾個 Bit (3 % 8 = 3)
-            
-            // 如果 Byte 超出範圍
+            // 如果超出範圍
             if (byte_idx >= raw.size()) return false;
 
-            // Mitsubishi 3E Frame Bit Order check:
-            // 通常 Low Bit 在前，如果有問題可能需要改 (0x01 << bit_idx)
-            // (raw[byte_idx] >> 4) & 1  <-- Mitsubishi 常常是 High/Low nibble 問題，
-            // 但標準 MC Protocol 1 bit read 是依序排列。
-            // 這裡假設: Byte 0 = M500~M507 (M500 is bit 0? or bit 7?)
-            // 根據經驗，MC Protocol binary 16 bit mode:
-            // bit 0 = M500, bit 1 = M501... 
-            return (bool)((raw[byte_idx] >> bit_idx) & 1);
+            // 判斷是高位還是低位 (偶數=低位, 奇數=高位)
+            bool is_high_nibble = (offset % 2 == 1);
+
+            uint8_t val = raw[byte_idx];
+            if (is_high_nibble) {
+                return (bool)((val >> 4) & 0x01); // 取高 4 位
+            } else {
+                return (bool)(val & 0x01);        // 取低 4 位
+            }
         };
 
         // 使用 DB 設定的點位來取值
@@ -136,8 +137,16 @@ private:
         std::string command = cmd.value("command", "");
 
         if (command == "GO_NOGO") {
-            int val = cmd.value("payload", 0);
-            plc_->write_bit(Config::get().points.go_nogo, val == 1);
+            int val = cmd.value("payload", 0); // 1=OK, 0=NG
+            auto& pts = Config::get().points;
+
+            spdlog::info("[Controller] Writing GO_NOGO: {}", val ? "OK" : "NG");
+            
+            // ✅ [修正] 寫入邏輯序列 (Sequence)
+            plc_->write_bit(pts.write_result, val == 1);
+
+            // 2. 寫入觸發訊號 (M86) -> 通知機台讀取
+            // plc_->write_bit(pts.write_trigger, true);
         }
         else if (command == "STEP_UPDATE") {
             // 純 Log 或者是未來擴充用

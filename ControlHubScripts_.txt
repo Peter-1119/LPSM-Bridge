@@ -1,0 +1,1022 @@
+// src/core/Config.hpp
+#pragma once
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <algorithm> // for std::min, std::max
+#include <mysql.h>   // MySQL C API
+#include "core/Logger.hpp"
+
+// DB 連線設定
+const char* CFG_DB_HOST = "10.8.32.64";
+const char* CFG_DB_USER = "sfuser";
+const char* CFG_DB_PASS = "1q2w3e4R";
+const char* CFG_DB_NAME = "sfdb4070";
+
+class Config {
+public:
+    struct PlcPoints {
+        int up_in = 503;
+        int up_out = 506;
+        int dn_in = 542;
+        int dn_out = 545;
+        int start = 630;
+        // ✅ [修正] 拆分寫入點位
+        int write_result = 87;  // M87
+        int write_trigger = 86; // M86
+    };
+
+    struct AppConfig {
+        std::string hub_ip = ""; 
+        std::string plc_ip = "10.8.142.137";
+        int plc_port = 1285;
+        PlcPoints points;
+        std::unordered_map<std::string, std::string> camera_mapping;
+    };
+
+    static AppConfig& get() {
+        static AppConfig instance;
+        return instance;
+    }
+
+    // 唯一的載入入口：從 DB 讀取
+    static bool load_from_db(const std::string& local_ip) {
+        MYSQL* con = mysql_init(NULL);
+        if (con == NULL) {
+            spdlog::error("[Config] MySQL init failed");
+            return false;
+        }
+
+        // ✅ [新增] 設定超時與關閉 SSL 驗證 (解決 0x800B0109)
+        int timeout = 3;
+        mysql_options(con, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+        
+        my_bool ssl_verify = 0; 
+        mysql_options(con, MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &ssl_verify);
+
+        if (!mysql_real_connect(con, CFG_DB_HOST, CFG_DB_USER, CFG_DB_PASS, CFG_DB_NAME, 3306, NULL, 0)) {
+            spdlog::error("[Config] DB Connection Failed: {}", mysql_error(con));
+            mysql_close(con);
+            return false;
+        }
+
+        auto& cfg = get();
+        cfg.hub_ip = local_ip;
+
+        // 1. 讀取 PLC 配置
+        std::string sql = "SELECT plc_ip, plc_port, addr_up_in, addr_up_out, addr_dn_in, addr_dn_out, addr_start, addr_write_result, addr_write_trigger FROM 2did_machine_config WHERE hub_ip = '" + local_ip + "'";
+        if (mysql_query(con, sql.c_str()) == 0) {
+            MYSQL_RES* res = mysql_store_result(con);
+            if (MYSQL_ROW row = mysql_fetch_row(res)) {
+                if(row[0]) cfg.plc_ip = row[0];
+                if(row[1]) cfg.plc_port = std::stoi(row[1]);
+                if(row[2]) cfg.points.up_in = std::stoi(row[2]);
+                if(row[3]) cfg.points.up_out = std::stoi(row[3]);
+                if(row[4]) cfg.points.dn_in = std::stoi(row[4]);
+                if(row[5]) cfg.points.dn_out = std::stoi(row[5]);
+                if(row[6]) cfg.points.start = std::stoi(row[6]);
+                // ✅ [修正] 讀取 M87 和 M86
+                if(row[7]) cfg.points.write_result = std::stoi(row[7]);
+                if(row[8]) cfg.points.write_trigger = std::stoi(row[8]);
+                
+                spdlog::info("[Config] PLC Loaded from DB. PLC IP: {}, Port: {}", cfg.plc_ip, cfg.plc_port);
+            } else {
+                spdlog::error("[Config] CRITICAL: No config found for this Hub IP: {} in table 2did_machine_config", local_ip);
+                mysql_free_result(res);
+                mysql_close(con);
+                return false; 
+            }
+            mysql_free_result(res);
+        } else {
+            spdlog::error("[Config] Query PLC Failed: {}", mysql_error(con));
+            mysql_close(con);
+            return false;
+        }
+
+        // 2. 讀取相機配置
+        sql = "SELECT camera_ip, camera_role FROM 2did_machine_cameras WHERE hub_ip = '" + local_ip + "'";
+        if (mysql_query(con, sql.c_str()) == 0) {
+            MYSQL_RES* res = mysql_store_result(con);
+            cfg.camera_mapping.clear();
+            while (MYSQL_ROW row = mysql_fetch_row(res)) {
+                if (row[0] && row[1]) {
+                    cfg.camera_mapping[row[0]] = row[1];
+                    spdlog::info("[Config] Camera Mapped: {} -> {}", row[0], row[1]);
+                }
+            }
+            mysql_free_result(res);
+        }
+
+        mysql_close(con);
+        return true;
+    }
+};
+
+// src/core/Logger.hpp
+#pragma once
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/async.h>
+#include <memory>
+
+class Logger {
+public:
+    static void init() {
+        // 使用異步 Logger 以避免 I/O 阻塞主執行緒
+        auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+        spdlog::init_thread_pool(8192, 1);
+        auto logger = std::make_shared<spdlog::async_logger>("app", console_sink, spdlog::thread_pool(), spdlog::async_overflow_policy::block);
+        
+        spdlog::set_default_logger(logger);
+        spdlog::set_pattern("[%H:%M:%S.%e] [%^%l%$] [thread %t] %v");
+        spdlog::set_level(spdlog::level::info);
+    }
+};
+
+// src/core/MessageBus.hpp
+// src/core/MessageBus.hpp
+#pragma once
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <string>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
+
+struct Message {
+    std::string source;  // "PLC", "CAM_L", "WS"
+    std::string type;    // "DATA", "CMD", "LOG"
+    json payload;        // 統一使用 JSON 傳遞數據
+};
+
+class MessageBus {
+private:
+    std::queue<Message> queue_;
+    std::mutex mutex_;
+    std::condition_variable cond_;
+    bool stop_ = false;
+
+public:
+    void push(const Message& msg) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            queue_.push(msg);
+        }
+        cond_.notify_one();
+    }
+
+    // 阻塞式獲取，適合 Logic Thread 使用
+    bool pop(Message& msg) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cond_.wait(lock, [this]{ return !queue_.empty() || stop_; });
+        
+        if (stop_ && queue_.empty()) return false;
+        
+        msg = queue_.front();
+        queue_.pop();
+        return true;
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cond_.notify_all();
+    }
+};
+
+// src/driver/CamServer.hpp
+#pragma once
+#include <boost/asio.hpp>
+#include <spdlog/spdlog.h>
+#include "core/MessageBus.hpp"
+#include "core/Config.hpp" // 需要讀取 Config
+
+using boost::asio::ip::tcp;
+
+class CamSession : public std::enable_shared_from_this<CamSession> {
+    tcp::socket socket_;
+    std::shared_ptr<MessageBus> bus_;
+    char data_[1024];
+    boost::asio::steady_timer timeout_timer_;
+    std::string client_id_;
+
+public:
+    CamSession(tcp::socket socket, std::shared_ptr<MessageBus> bus, boost::asio::io_context& ioc) : socket_(std::move(socket)), bus_(bus), timeout_timer_(ioc) {
+        // ✅ [關鍵] 取得 IP 並映射到 Config 中的名稱 (e.g. CAMERA_LEFT_1)
+        try {
+            std::string ip = socket_.remote_endpoint().address().to_string();
+            auto& mapping = Config::get().camera_mapping;
+            
+            // 如果 Config 有設定這個 IP，就使用設定的名稱 (如 CAMERA_LEFT_1)
+            // 這樣前端 App.vue: if (source.startsWith("CAMERA_LEFT")) 才能正確運作
+            if (mapping.count(ip)) {
+                client_id_ = mapping[ip];
+            } else {
+                client_id_ = "CAMERA_UNKNOWN_" + ip;
+                spdlog::warn("[CAM] Unknown Camera IP: {}, please check config.json", ip);
+            }
+        } catch(...) {
+            client_id_ = "CAMERA_ERROR";
+        }
+    }
+
+    void start() {
+        spdlog::info("[CAM] Connected: {}", client_id_);
+        do_read();
+        reset_timeout();
+    }
+
+private:
+    void do_read() {
+        auto self(shared_from_this());
+        socket_.async_read_some(boost::asio::buffer(data_), [this, self](boost::system::error_code ec, std::size_t length) {
+            if (!ec) {
+                std::string barcode(data_, length);
+                // 移除換行符
+                barcode.erase(std::remove(barcode.begin(), barcode.end(), '\n'), barcode.end());
+                barcode.erase(std::remove(barcode.begin(), barcode.end(), '\r'), barcode.end());
+                
+                if (!barcode.empty()) {
+                    spdlog::info("[CAM] {} Recv: {}", client_id_, barcode);
+                    // ✅ 直接送字串，Controller 不用處理，WsServer 會自動轉發給前端
+                    bus_->push({ client_id_, "BARCODE", barcode });
+                }
+                
+                reset_timeout();
+                do_read();
+            }
+        });
+    }
+
+    void reset_timeout() {
+        timeout_timer_.expires_after(std::chrono::seconds(60));
+        timeout_timer_.async_wait([this, self=shared_from_this()](boost::system::error_code ec){
+            if (!ec) {
+                // Send timeout signal
+                bus_->push({ client_id_ + "_MONITOR", "TIMEOUT", "TIMEOUT_BLANK" });
+                // Start timer again
+                reset_timeout();
+            }
+        });
+    }
+};
+
+class CamServer {
+    boost::asio::io_context& ioc_;
+    tcp::acceptor acceptor_;
+    std::shared_ptr<MessageBus> bus_;
+
+public:
+    CamServer(boost::asio::io_context& ioc, std::shared_ptr<MessageBus> bus, int port) : ioc_(ioc), acceptor_(ioc, tcp::endpoint(tcp::v4(), port)), bus_(bus) {
+        do_accept();
+    }
+
+private:
+    void do_accept() {
+        acceptor_.async_accept([this](boost::system::error_code ec, tcp::socket socket) {
+            if (!ec) {
+                std::make_shared<CamSession>(std::move(socket), bus_, ioc_)->start();
+            }
+            do_accept();
+        });
+    }
+};
+
+// src/driver/KeyboardHook.hpp
+#pragma once
+#include <windows.h>
+#include <iostream>
+#include <string>
+#include <thread>
+#include "core/MessageBus.hpp"
+#include "core/Logger.hpp"
+
+// 全域變數是 Windows Hook 的限制，因為 Callback 必須是靜態的
+static HHOOK g_hHook = NULL;
+static std::shared_ptr<MessageBus> g_bus_ref = nullptr;
+static std::string g_barcode_buffer;
+static std::mutex g_hook_mutex;
+
+// 鍵盤鉤子回呼函式
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION) {
+        KBDLLHOOKSTRUCT *p = (KBDLLHOOKSTRUCT *)lParam;
+
+        if (wParam == WM_KEYDOWN) {
+            DWORD vkCode = p->vkCode;
+
+            // 1. 處理 Enter (掃碼結束)
+            if (vkCode == VK_RETURN) {
+                std::lock_guard<std::mutex> lock(g_hook_mutex);
+                if (!g_barcode_buffer.empty()) {
+                    // ✅ [需求2] 掃到條碼直接輸出文字
+                    spdlog::info("[Scanner] Detected: {}", g_barcode_buffer);
+                    
+                    if (g_bus_ref) {
+                        if (g_barcode_buffer.compare("1") == 0) {
+                            spdlog::info("[Broadcast] Camera Test Input: 4240912013144");
+                            g_bus_ref->push({"CAMERA_LEFT_1", "DATA", "4240912013144"});
+                        }
+                        else if (g_barcode_buffer.compare("2") == 0) {
+                            spdlog::info("[Broadcast] Camera Test Input: 4240912012548");
+                            g_bus_ref->push({"CAMERA_RIGHT_1", "DATA", "4240912012548"});
+                        }
+                        else if (g_barcode_buffer.compare("3") == 0) {
+                            spdlog::info("[Broadcast] Camera Test Input: 4240913025717");
+                            g_bus_ref->push({"CAMERA_RIGHT_1", "DATA", "4240913025717"});
+                        }
+                        else if (g_barcode_buffer.compare("4") == 0) {
+                            spdlog::info("[Broadcast] Camera Test Input: 4240914001156");
+                            g_bus_ref->push({"CAMERA_RIGHT_2", "DATA", "4240914001156"});
+                        }
+                        else if (g_barcode_buffer.compare("0") == 0) {
+                            spdlog::info("[Broadcast] Camera Test Input: TIMEOUT_BLANK");
+                            g_bus_ref->push({"CAMERA_LEFT_GROUP_MONITOR", "DATA", "TIMEOUT_BLANK"});
+                            g_bus_ref->push({"CAMERA_RIGHT_GROUP_MONITOR", "DATA", "TIMEOUT_BLANK"});
+                        }
+                        else {
+                            spdlog::info("[Broadcast] Keyboard Input: {}", g_barcode_buffer);
+                            g_bus_ref->push({"SCANNER", "DATA", g_barcode_buffer});
+                        }
+                    }
+                    g_barcode_buffer.clear();
+                }
+            }
+            // 2. 處理一般字元 (0-9, A-Z)
+            else {
+                // 取得鍵盤狀態 (處理 Shift 大小寫)
+                BYTE keyboardState[256];
+                GetKeyboardState(keyboardState);
+                WORD asciiBuffer[2];
+                
+                // 轉換 Virtual Key 為 ASCII
+                int len = ToAscii(vkCode, p->scanCode, keyboardState, asciiBuffer, 0);
+                if (len == 1) {
+                    char c = (char)asciiBuffer[0];
+                    // 過濾掉不可見字元，只留條碼常用的數字與字母
+                    if (isalnum(c) || c == '-' || c == '_') {
+                        std::lock_guard<std::mutex> lock(g_hook_mutex);
+                        g_barcode_buffer += c;
+                    }
+                }
+            }
+        }
+    }
+    // 3. 重要：傳遞給下一個鉤子，確保不阻擋使用者打字
+    return CallNextHookEx(g_hHook, nCode, wParam, lParam);
+}
+
+class KeyboardHook {
+public:
+    KeyboardHook(std::shared_ptr<MessageBus> bus) {
+        g_bus_ref = bus;
+    }
+
+    // 啟動 Hook 執行緒
+    void start() {
+        std::thread t([](){
+            spdlog::info("[Hook] Starting Global Keyboard Hook...");
+            
+            // 安裝鉤子
+            g_hHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(NULL), 0);
+            
+            if (!g_hHook) {
+                spdlog::error("[Hook] Failed to install hook!");
+                return;
+            }
+
+            // Windows Hook 需要 Message Loop 才能運作
+            MSG msg;
+            while (GetMessage(&msg, NULL, 0, 0)) {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+
+            UnhookWindowsHookEx(g_hHook);
+        });
+        t.detach(); // 讓它在背景跑
+    }
+};
+
+// src/driver/PlcClient.hpp
+#pragma once
+#include <algorithm>
+#include <boost/asio.hpp>
+#include <vector>
+#include <queue>
+#include <mutex>
+#include "core/MessageBus.hpp"
+#include <spdlog/spdlog.h>
+
+using boost::asio::ip::tcp;
+
+class PlcClient {
+private:
+    boost::asio::io_context& ioc_;
+    tcp::socket socket_;
+    tcp::endpoint endpoint_;
+    std::shared_ptr<MessageBus> bus_;
+    boost::asio::steady_timer timer_;    // 用於重連延遲
+    boost::asio::steady_timer op_timer_; // ✅ 新增：用於單次操作超時
+    bool connected_ = false;
+    
+    int start_addr_ = 0;
+    int read_count_ = 0;
+
+    struct WriteCommand {
+        int address;
+        bool on;
+    };
+    std::queue<WriteCommand> write_queue_;
+
+public:
+    PlcClient(boost::asio::io_context& ioc, std::shared_ptr<MessageBus> bus, std::string ip, int port) 
+        : ioc_(ioc), socket_(ioc), bus_(bus), timer_(ioc), op_timer_(ioc) { // 初始化 op_timer_
+        
+        try {
+            endpoint_ = tcp::endpoint(boost::asio::ip::make_address(ip), port);
+        } catch (...) {
+            spdlog::error("[PLC] Invalid IP Address: {}", ip);
+        }
+
+        auto& pts = Config::get().points;
+        int min_addr = std::min({pts.up_in, pts.up_out, pts.dn_in, pts.dn_out, pts.start});
+        int max_addr = std::max({pts.up_in, pts.up_out, pts.dn_in, pts.dn_out, pts.start});
+        
+        start_addr_ = (min_addr / 100) * 100;
+        int needed = max_addr - start_addr_ + 20;
+        read_count_ = (needed < 100) ? 100 : needed; 
+        
+        spdlog::info("[PLC] Auto-Range: Start M{}, Count {}", start_addr_, read_count_);
+    }
+
+    void start() { 
+        boost::asio::post(ioc_, [this]() { do_connect(); });
+    }
+
+    void write_bit(int address, bool on) {
+        boost::asio::post(ioc_, [this, address, on]() {
+            write_queue_.push({address, on});
+            // 如果當前斷線中，連線恢復後會自動消化 Queue，這裡不用做額外處理
+        });
+    }
+
+private:
+    void do_connect() {
+        spdlog::info("[PLC] Connecting to {}...", endpoint_.address().to_string());
+        
+        // 設定連線超時 3秒
+        op_timer_.expires_after(std::chrono::seconds(3));
+        op_timer_.async_wait([this](boost::system::error_code ec){
+            if (ec != boost::asio::error::operation_aborted) {
+                // 時間到，強制關閉 Socket 觸發 Connect 錯誤
+                socket_.close();
+            }
+        });
+
+        socket_.async_connect(endpoint_, [this](boost::system::error_code ec) {
+            op_timer_.cancel(); // 取消超時計時
+
+            if (!ec) {
+                spdlog::info("[PLC] Connected.");
+                connected_ = true;
+                process_next_action(); 
+            } else {
+                // 這裡不要用 handle_error，因為還沒連上
+                spdlog::error("[PLC] Connect failed: {}. Retry in 3s.", ec.message());
+                timer_.expires_after(std::chrono::seconds(3));
+                timer_.async_wait([this](boost::system::error_code){ do_connect(); });
+            }
+        });
+    }
+
+    void process_next_action() {
+        if (!connected_) return;
+
+        if (!write_queue_.empty()) {
+            auto cmd = write_queue_.front();
+            write_queue_.pop();
+            do_write_request(cmd.address, cmd.on);
+        } else {
+            do_read_request();
+        }
+    }
+
+    // ✅ 設定操作超時 (2秒)
+    void start_op_timeout() {
+        op_timer_.expires_after(std::chrono::milliseconds(2000));
+        op_timer_.async_wait([this](boost::system::error_code ec){
+            if (ec != boost::asio::error::operation_aborted) {
+                spdlog::warn("[PLC] Operation Timeout! Resetting connection...");
+                socket_.close(); // 強制斷線，觸發 async_write/read 的 error handler
+            }
+        });
+    }
+
+    // --- 寫入流程 ---
+    void do_write_request(int addr, bool on) {
+        auto packet = build_write_packet(addr, on);
+        auto buf = std::make_shared<std::vector<uint8_t>>(packet);
+
+        start_op_timeout(); // 啟動計時
+
+        boost::asio::async_write(socket_, boost::asio::buffer(*buf),
+            [this, buf, addr, on](boost::system::error_code ec, std::size_t) {
+                if (!ec) {
+                    do_write_response(addr, on);
+                } else {
+                    handle_error(ec);
+                }
+            });
+    }
+
+    void do_write_response(int addr, bool on) {
+        auto buf = std::make_shared<std::vector<uint8_t>>(1024);
+        socket_.async_read_some(boost::asio::buffer(*buf),
+            [this, buf, addr, on](boost::system::error_code ec, std::size_t len) {
+                op_timer_.cancel(); // 操作完成，取消計時
+
+                if (!ec) {
+                    spdlog::info("[PLC] Write Success: M{} -> {}", addr, on ? "ON" : "OFF");
+                    schedule_next_cycle(50); 
+                } else {
+                    handle_error(ec);
+                }
+            });
+    }
+
+    // --- 讀取流程 ---
+    void do_read_request() {
+        auto packet = build_read_packet(start_addr_, read_count_);
+        auto buf = std::make_shared<std::vector<uint8_t>>(packet);
+        
+        start_op_timeout(); // 啟動計時
+
+        boost::asio::async_write(socket_, boost::asio::buffer(*buf),
+            [this, buf](boost::system::error_code ec, std::size_t) {
+                if (!ec) {
+                    do_read_response();
+                } else {
+                    handle_error(ec);
+                }
+            });
+    }
+
+    void do_read_response() {
+        auto buf = std::make_shared<std::vector<uint8_t>>(1024);
+        socket_.async_read_some(boost::asio::buffer(*buf),
+            [this, buf](boost::system::error_code ec, std::size_t len) {
+                op_timer_.cancel(); // 操作完成，取消計時
+
+                if (!ec) {
+                    if (len > 11) { 
+                        std::vector<uint8_t> data(buf->begin() + 11, buf->begin() + len);
+                        bus_->push({"PLC", "STATUS", json{{"raw", data}, {"start_addr", start_addr_}}});
+                    }
+                    schedule_next_cycle(200);
+                } else {
+                    handle_error(ec);
+                }
+            });
+    }
+
+    void schedule_next_cycle(int ms) {
+        timer_.expires_after(std::chrono::milliseconds(ms));
+        timer_.async_wait([this](boost::system::error_code ec){
+            if (!ec) process_next_action();
+        });
+    }
+
+    void handle_error(boost::system::error_code ec) {
+        // ✅ 修正：如果是被 Timer 強制 close 的，ec 會是 operation_aborted (或其他)，這時我們不能 return，要繼續跑重連流程
+        if (ec == boost::asio::error::operation_aborted && connected_) {
+            // 這是被 timeout 觸發的 abort，需要重連
+            spdlog::warn("[PLC] Operation aborted due to timeout.");
+        } 
+        else if (ec == boost::asio::error::operation_aborted) {
+            // 這是程式關閉時的 abort，直接退出
+            return;
+        }
+        else {
+            // 其他網路錯誤
+            spdlog::error("[PLC] Error: {} (Code: {})", ec.message(), ec.value());
+        }
+        
+        connected_ = false;
+        socket_.close();
+        op_timer_.cancel(); // 確保計時器也停掉
+        
+        // 3秒後重連
+        timer_.expires_after(std::chrono::seconds(3));
+        timer_.async_wait([this](boost::system::error_code){ do_connect(); });
+    }
+
+    // (封包建立函式保持不變)
+    std::vector<uint8_t> build_read_packet(int start_addr, int count) {
+        std::vector<uint8_t> packet = {
+            0x50, 0x00, 0x00, 0xFF, 0xFF, 0x03, 0x00, 0x0C, 0x00, 0x10, 0x00,
+            0x01, 0x04, 0x01, 0x00,
+            (uint8_t)(start_addr & 0xFF), (uint8_t)((start_addr >> 8) & 0xFF), 0x00,
+            0x90, (uint8_t)(count & 0xFF), (uint8_t)((count >> 8) & 0xFF)
+        };
+        return packet;
+    }
+
+    std::vector<uint8_t> build_write_packet(int addr, bool on) {
+        std::vector<uint8_t> packet = {
+            0x50, 0x00, 0x00, 0xFF, 0xFF, 0x03, 0x00, 0x0C, 0x00, 0x10, 0x00,
+            0x01, 0x14, 0x01, 0x00, // Cmd 1401 (Batch Write), Sub 0001
+            (uint8_t)(addr & 0xFF), (uint8_t)((addr >> 8) & 0xFF), 0x00,
+            0x90, 
+            0x01, 0x00, // 1 point
+            // ✅ [修正] ON 時送 0x01 (Bit 0)，而不是 0x10
+            (uint8_t)(on ? 0x01 : 0x00) 
+        };
+        return packet;
+    }
+};
+
+// src/logic/Controller.hpp
+#pragma once
+#include <memory>
+#include "core/MessageBus.hpp"
+#include "driver/PlcClient.hpp"
+#include "core/Config.hpp"
+#include "server/WsServer.hpp"
+
+class Controller {
+private:
+    std::shared_ptr<MessageBus> bus_;
+    std::shared_ptr<PlcClient> plc_;
+    std::shared_ptr<WsServer> ws_server_;
+
+    // ✅ 新增：紀錄上一次的 PLC 狀態與 Log 時間
+    json last_plc_state_;
+    std::chrono::steady_clock::time_point last_log_time_;
+
+public:
+    Controller(std::shared_ptr<MessageBus> bus, std::shared_ptr<PlcClient> plc, std::shared_ptr<WsServer> ws) : bus_(bus), plc_(plc), ws_server_(ws) {
+        last_log_time_ = std::chrono::steady_clock::now();
+    }
+
+    void run() {
+        Message msg;
+        while (bus_->pop(msg)) {
+            try {
+                // 1. PLC 狀態更新 (由後端主動推播)
+                if (msg.source == "PLC" && msg.type == "STATUS") {
+                    handle_plc_update(msg.payload);
+                }
+                // 2. 前端指令處理
+                else if (msg.source == "WS" && msg.type == "CMD") {
+                    handle_ws_command(msg.payload);
+                }
+                // 3. 掃碼槍輸入 (純轉發，邏輯在前端)
+                else if (msg.source == "SCANNER") {
+                    spdlog::info("[Controller] Scanner Input Triggered");
+                }
+
+                // 4. 統一廣播路由 (Routing)
+                // 決定哪些訊息要轉發給前端
+                bool should_broadcast = (
+                    msg.source == "SYS" || 
+                    msg.source == "WS" || 
+                    // msg.source == "PLC_MONITOR" || // ⚠️ 修改：PLC 改由 handle_plc_update 內部控制廣播
+                    msg.source == "SCANNER" ||
+                    msg.source.rfind("CAMERA", 0) == 0 
+                );
+
+                if (should_broadcast) {
+                    json wrapper;
+                    if (msg.type == "HEARTBEAT") {
+                        if (msg.source == "SYS") continue; 
+                    } 
+                    else if (msg.type == "STATE_SYNC") {
+                        wrapper = {{"type", "control"}, {"command", "STATE_SYNC"}, {"payload", msg.payload}};
+                    }
+                    else {
+                        wrapper = {{"type", "data"}, {"source", msg.source}, {"payload", msg.payload}};
+                    }
+                    
+                    if (!wrapper.empty()) {
+                        ws_server_->broadcast(wrapper.dump());
+                    }
+                }
+
+            } catch (const std::exception& e) {
+                spdlog::error("Controller error: {}", e.what());
+            }
+        }
+    }
+
+private:
+    // 處理 PLC 訊號 -> 判斷是否變更 -> 廣播 & Log
+    void handle_plc_update(const json& payload) {
+        auto raw = payload["raw"].get<std::vector<uint8_t>>();
+        int base_addr = payload["start_addr"].get<int>();
+        auto& pts = Config::get().points;
+
+        // ✅ 通用 Bit 解析函式
+        auto get_bit = [&](int target_addr) {
+            int offset = target_addr - base_addr;
+            if (offset < 0) return false;
+
+            // 修正計算方式：除以 2 而不是 8
+            int byte_idx = offset / 2;
+            
+            // 如果超出範圍
+            if (byte_idx >= raw.size()) return false;
+
+            // 判斷是高位還是低位 (偶數=低位, 奇數=高位)
+            bool is_high_nibble = (offset % 2 == 1);
+
+            uint8_t val = raw[byte_idx];
+            if (is_high_nibble) {
+                return (bool)((val >> 4) & 0x01); // 取高 4 位
+            } else {
+                return (bool)(val & 0x01);        // 取低 4 位
+            }
+        };
+
+        // 使用 DB 設定的點位來取值
+        bool up_in  = get_bit(pts.up_in);
+        bool up_out = get_bit(pts.up_out);
+        bool dn_in  = get_bit(pts.dn_in);
+        bool dn_out = get_bit(pts.dn_out);
+        bool start  = get_bit(pts.start);
+
+        json plc_data = {
+            {"up_in", up_in ? 1 : 0},
+            {"up_out", up_out ? 1 : 0},
+            {"dn_in", dn_in ? 1 : 0},
+            {"dn_out", dn_out ? 1 : 0},
+            {"start_message", start ? 1 : 0}
+        };
+
+        // ✅ 優化 1: 只有狀態「變更」時才廣播給前端 (減少網路與 Log 垃圾)
+        if (plc_data != last_plc_state_) {
+            spdlog::info("[PLC] Status Changed: {}", plc_data.dump());
+            
+            // 手動觸發廣播 (因為 run() loop 裡把 PLC_MONITOR 的自動廣播關了)
+            json wrapper = {{"type", "data"}, {"source", "PLC_MONITOR"}, {"payload", plc_data}};
+            ws_server_->broadcast(wrapper.dump());
+            
+            last_plc_state_ = plc_data;
+        }
+
+        // ✅ 優化 2: 每 5 秒在 Terminal 顯示一次狀態 (Heartbeat Log)
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time_).count() >= 5) {
+            spdlog::info("[PLC] Monitor (5s): {}", plc_data.dump());
+            last_log_time_ = now;
+        }
+    }
+
+    void handle_ws_command(const json& cmd) {
+        std::string command = cmd.value("command", "");
+
+        if (command == "GO_NOGO") {
+            int val = cmd.value("payload", 0); // 1=OK, 0=NG
+            auto& pts = Config::get().points;
+
+            spdlog::info("[Controller] Writing GO_NOGO: {}", val ? "OK" : "NG");
+            
+            // ✅ [修正] 寫入邏輯序列 (Sequence)
+            plc_->write_bit(pts.write_result, val == 1);
+
+            // 2. 寫入觸發訊號 (M86) -> 通知機台讀取
+            // plc_->write_bit(pts.write_trigger, true);
+        }
+        else if (command == "STEP_UPDATE") {
+            // 純 Log 或者是未來擴充用
+            std::string step = cmd.value("payload", "");
+            spdlog::info("[Controller] Step updated to: {}", step);
+        }
+    }
+};
+
+// src/server/WsServer.hpp
+#pragma once
+#include "App.h"
+#include "core/MessageBus.hpp"
+#include "core/Logger.hpp" 
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <string>
+
+class WsServer {
+    std::shared_ptr<MessageBus> bus_;
+    struct PerSocketData {}; 
+    std::atomic<bool> running_{true};
+    
+    // ✅ 儲存 uWS 的 Loop 指標，用來做跨執行緒排程
+    uWS::Loop *loop_ = nullptr;
+    uWS::App* app_ptr = nullptr;
+
+public:
+    WsServer(std::shared_ptr<MessageBus> bus) : bus_(bus) {}
+
+    // ✅ 修改後的廣播介面：使用 defer 將任務丟回 WS 執行緒
+    void broadcast(const std::string& message) {
+        // 必須檢查 loop_ 是否存在 (Server 啟動後才有)
+        if (loop_ && app_ptr) {
+            // copy message (因為是非同步執行，必須複製一份字串)
+            // defer 會讓這個 lambda 在 WS 執行緒的安全時間點執行
+            loop_->defer([this, msg = message]() {
+                if (app_ptr) {
+                    app_ptr->publish("broadcast", msg, uWS::OpCode::TEXT, false);
+                    spdlog::info("[WS] SEND Broadcast: {}", msg);
+                }
+            });
+        }
+    }
+
+    void run(int port) {
+        // ✅ 1. 獲取當前執行緒的 Event Loop
+        // 注意：這行必須在 run 的這個執行緒內呼叫
+        loop_ = uWS::Loop::get();
+
+        uWS::App app;
+        app_ptr = &app;
+
+        std::thread hb_thread([this](){
+            while(running_) {
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                // 這裡只負責推 Event 到 Bus，不直接廣播，所以是安全的
+                bus_->push({"SYS", "HEARTBEAT", json{{"ts", std::time(nullptr)}}});
+            }
+        });
+
+        app.ws<PerSocketData>("/*", {
+            .open = [](auto *ws) {
+                ws->subscribe("broadcast"); 
+                spdlog::info("[WS] Client connected");
+                json welcome = {{"type", "info"}, {"message", "Connected to LPSM Backend"}};
+                ws->send(welcome.dump(), uWS::OpCode::TEXT, false);
+            },
+            .message = [this](auto *ws, std::string_view message, uWS::OpCode opCode) {
+                std::string msg_str(message);
+                // spdlog::info("[WS] RECV: {}", msg_str); // 怕太吵可以註解掉
+                try {
+                    auto j = json::parse(message);
+                    if (j.contains("command") && j["command"] == "HEARTBEAT") {
+                        // 回傳 ACK
+                        json ack = {{"type", "control"}, {"command", "HEARTBEAT_ACK"}, {"payload", {{"server_ts", std::time(nullptr) * 1000}, {"client_ts", j["payload"].value("ts", 0)}}}};
+                        ws->send(ack.dump(), uWS::OpCode::TEXT, false);
+                        return; 
+                    }
+                    bus_->push({ "WS", "CMD", j });
+                } catch(...) {}
+            },
+            .close = [](auto *ws, int code, std::string_view message) {
+                spdlog::info("[WS] Client disconnected");
+            }
+        }).listen("0.0.0.0", port, [port](auto *listen_socket) {
+            if (listen_socket) spdlog::info("[WS] Server listening on port {}", port);
+            else spdlog::error("[WS] FAILED to listen on port {}!", port);
+        }).run();
+
+        // 結束時清理
+        running_ = false;
+        app_ptr = nullptr;
+        loop_ = nullptr; // ✅ 清空 Loop 指標
+        
+        if(hb_thread.joinable()) hb_thread.join();
+    }
+};
+
+// src/main.cpp
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shellapi.h>
+#include <iostream>
+#include <thread>
+#include <string>
+#include <cstdlib> 
+#include <atomic>
+#include <csignal>
+#include <boost/asio.hpp> 
+
+#include "core/Logger.hpp"
+#include "core/MessageBus.hpp"
+#include "core/Config.hpp"
+#include "driver/PlcClient.hpp"
+#include "driver/CamServer.hpp"
+#include "driver/KeyboardHook.hpp"
+#include "server/WsServer.hpp"
+#include "logic/Controller.hpp"
+
+// 全域變數
+std::atomic<bool> g_running{true};
+
+void KillProcessOnPort(int port) {
+    std::string cmd = "for /f \"tokens=5\" %a in ('netstat -aon ^| find \":" + std::to_string(port) + "\" ^| find \"LISTENING\"') do taskkill /f /pid %a > nul 2>&1";
+    system(cmd.c_str());
+}
+
+BOOL WINAPI ConsoleHandler(DWORD signal) {
+    if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT || signal == CTRL_BREAK_EVENT) {
+        g_running = false;
+        return TRUE; 
+    }
+    return FALSE;
+}
+
+void OpenChromeOnWindows(std::string url) {
+    #ifdef _WIN32
+        ShellExecuteA(NULL, "open", "chrome.exe", url.c_str(), NULL, SW_SHOW);
+    #else
+        std::cout << "無法自動開啟 Chrome 此功能僅支援 Windows" << std::endl;
+        return;
+    #endif
+}
+
+std::string GetLocalIP() {
+    try {
+        boost::asio::io_context io_context;
+        boost::asio::ip::udp::resolver resolver(io_context);
+        boost::asio::ip::udp::socket socket(io_context);
+        
+        // ✅ [修正] 使用 make_address 替代 from_string
+        socket.connect(boost::asio::ip::udp::endpoint(boost::asio::ip::make_address("8.8.8.8"), 53));
+        
+        return socket.local_endpoint().address().to_string();
+    } catch (std::exception& e) {
+        spdlog::error("Failed to get local IP: {}", e.what());
+        return "127.0.0.1"; 
+    }
+}
+
+int main() {
+    SetConsoleOutputCP(65001);
+
+    // 1. 環境清理 (包含關閉殘留的 Chrome)
+    system("taskkill /F /IM chrome.exe >nul 2>&1");
+    KillProcessOnPort(8181); 
+    KillProcessOnPort(6060); 
+    
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+    // 2. 開啟網頁 (請確認現場是否連得到這個 IP)
+    OpenChromeOnWindows("http://10.8.32.64:2102/");
+    // OpenChromeOnWindows("http://localhost:5173/");
+    
+    // 給瀏覽器足夠時間啟動，避免 Port 搶佔問題
+    std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+
+    if (!SetConsoleCtrlHandler(ConsoleHandler, TRUE)) {
+        std::cerr << "錯誤: 無法註冊控制台處理程序" << std::endl;
+    }
+
+    Logger::init();
+
+    // 3. 取得本機 IP 並載入設定
+    std::string my_ip = GetLocalIP();
+    spdlog::info("Detected Local IP: {}", my_ip);
+
+    if (!Config::load_from_db(my_ip)) {
+        spdlog::error("❌ 無法從資料庫載入設定！可能是 IP 未註冊或 DB 連線失敗。");
+        spdlog::error("程式將在 10 秒後退出...");
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        return -1; // 強制結束
+    }
+
+    spdlog::info("LPSM System Starting...");
+    
+    auto bus = std::make_shared<MessageBus>();
+    boost::asio::io_context ioc; 
+
+    // 4. 使用動態 IP 建立元件
+    auto plc = std::make_shared<PlcClient>(ioc, bus, Config::get().plc_ip, Config::get().plc_port);
+    auto cam = std::make_shared<CamServer>(ioc, bus, 6060);
+    auto ws_server = std::make_shared<WsServer>(bus);
+    auto controller = std::make_shared<Controller>(bus, plc, ws_server);
+
+    // 5. 啟動所有執行緒
+    plc->start();
+    std::thread io_thread([&ioc](){ 
+        auto work = boost::asio::make_work_guard(ioc);
+        ioc.run(); 
+    });
+
+    KeyboardHook scanner_hook(bus);
+    scanner_hook.start();
+
+    std::thread logic_thread([controller](){ controller->run(); });
+    std::thread ws_thread([ws_server](){ ws_server->run(8181); });
+
+    spdlog::info("LPSM System Started. Press [X] to exit.");
+
+    while (g_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    spdlog::info("[System] Stopping services and exiting...");
+    TerminateProcess(GetCurrentProcess(), 0);
+    return 0;
+}
+
