@@ -1,5 +1,6 @@
 PromptGenerator.py
 ControlHubScripts*.txt
+*.json
 
 build/
 DLLs/
