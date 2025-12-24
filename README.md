@@ -114,7 +114,8 @@ CREATE TABLE IF NOT EXISTS `2did_machine_cameras` (
 
 ---
 
-## 🚀 編譯與部署 (Build & Deploy)1. 編譯 (Build)請在 MSYS2 UCRT64 終端機執行：Bashmkdir build
+## 🚀 編譯與部署 (Build & Deploy)
+1. 編譯 (Build)請在 MSYS2 UCRT64 終端機執行：Bashmkdir build
 
 ```Bash
 cd build
