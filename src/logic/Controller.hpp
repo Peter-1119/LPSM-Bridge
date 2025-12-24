@@ -146,7 +146,7 @@ private:
             plc_->write_bit(pts.write_result, val == 1);
 
             // 2. 寫入觸發訊號 (M86) -> 通知機台讀取
-            // plc_->write_bit(pts.write_trigger, true);
+            plc_->write_bit(pts.write_trigger, true);
         }
         else if (command == "STEP_UPDATE") {
             // 純 Log 或者是未來擴充用
