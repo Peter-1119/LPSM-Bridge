@@ -73,16 +73,16 @@ std::string GetLocalIP() {
 int main() {
     SetConsoleOutputCP(65001);
 
-    // 1. 環境清理 (包含關閉殘留的 Chrome)
+    // 1. 環境清理 (包含關閉殘留的 Edge)
     system("taskkill /F /IM msedge.exe >nul 2>&1");
-    KillProcessOnPort(8181); 
-    KillProcessOnPort(6060); 
+    KillProcessOnPort(8181);  // Websocket port
+    KillProcessOnPort(6060);  // Camera port
     
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
     // 2. 開啟網頁 (請確認現場是否連得到這個 IP)
-    OpenEdgeOnWindows("http://10.8.32.64:2102/");
-    // OpenEdgeOnWindows("http://localhost:5173/");
+    // OpenEdgeOnWindows("http://10.8.32.64:2102/");
+    OpenEdgeOnWindows("http://localhost:5173/");
     
     // 給瀏覽器足夠時間啟動，避免 Port 搶佔問題
     std::this_thread::sleep_for(std::chrono::milliseconds(3000));

@@ -6,6 +6,7 @@
 #include <mutex>
 #include "core/MessageBus.hpp"
 #include <spdlog/spdlog.h>
+#include <unordered_map>
 
 using boost::asio::ip::tcp;
 
@@ -15,12 +16,17 @@ private:
     tcp::socket socket_;
     tcp::endpoint endpoint_;
     std::shared_ptr<MessageBus> bus_;
+    std::unordered_map<int, bool> sent_state_cache_;
     boost::asio::steady_timer timer_;    // 用於重連延遲
     boost::asio::steady_timer op_timer_; // ✅ 新增：用於單次操作超時
+    boost::asio::steady_timer reset_timer_;
     bool connected_ = false;
     
     int start_addr_ = 0;
     int read_count_ = 0;
+    
+    int addr_trigger_ = 0; // M86
+    int addr_result_ = 0;  // M87
 
     struct WriteCommand {
         int address;
@@ -30,7 +36,7 @@ private:
 
 public:
     PlcClient(boost::asio::io_context& ioc, std::shared_ptr<MessageBus> bus, std::string ip, int port) 
-        : ioc_(ioc), socket_(ioc), bus_(bus), timer_(ioc), op_timer_(ioc) { // 初始化 op_timer_
+        : ioc_(ioc), socket_(ioc), bus_(bus), timer_(ioc), op_timer_(ioc), reset_timer_(ioc) { 
         
         try {
             endpoint_ = tcp::endpoint(boost::asio::ip::make_address(ip), port);
@@ -41,6 +47,9 @@ public:
         auto& pts = Config::get().points;
         int min_addr = std::min({pts.up_in, pts.up_out, pts.dn_in, pts.dn_out, pts.start});
         int max_addr = std::max({pts.up_in, pts.up_out, pts.dn_in, pts.dn_out, pts.start});
+
+        addr_trigger_ = pts.write_trigger;
+        addr_result_  = pts.write_result;
         
         start_addr_ = (min_addr / 100) * 100;
         int needed = max_addr - start_addr_ + 20;
@@ -53,10 +62,69 @@ public:
         boost::asio::post(ioc_, [this]() { do_connect(); });
     }
 
+    // 用於：系統啟動、PLC 重連、WS 斷線
+    void reset_safe_signals() {
+        boost::asio::post(ioc_, [this]() {
+            spdlog::warn("[PLC] Resetting Safe Signals (M{}, M{} -> OFF)", addr_trigger_, addr_result_);
+            
+            // 強制寫入 false，並更新緩存確保同步
+            // 注意：這裡直接 push，不檢查緩存，確保一定送出
+            write_queue_.push({addr_trigger_, false});
+            sent_state_cache_[addr_trigger_] = false;
+
+            write_queue_.push({addr_result_, false});
+            sent_state_cache_[addr_result_] = false;
+        });
+    }
+
     void write_bit(int address, bool on) {
         boost::asio::post(ioc_, [this, address, on]() {
+            // 檢查緩存：如果狀態一樣，則忽略 (減少 PLC 負擔)
+            if (sent_state_cache_.count(address) && sent_state_cache_[address] == on) {
+                return; 
+            }
+
+            // 狀態不同，加入寫入隊列並更新緩存
             write_queue_.push({address, on});
-            // 如果當前斷線中，連線恢復後會自動消化 Queue，這裡不用做額外處理
+            sent_state_cache_[address] = on;
+        });
+    }
+
+    void write_pulse_pair(int addr1, bool val1, int addr2, bool val2) {
+        boost::asio::post(ioc_, [this, addr1, val1, addr2, val2]() {
+            // 1. 取消上一次的計時 (防止舊的 OFF 訊號干擾新的觸發)
+            reset_timer_.cancel();
+
+            // 2. 寫入當前訊號 (ON) - 這裡做「狀態過濾」
+            // 如果已經是 ON，就不重複送封包，但「計時器」必須重啟
+            if (!sent_state_cache_.count(addr1) || sent_state_cache_[addr1] != val1) {
+                write_queue_.push({addr1, val1});
+                sent_state_cache_[addr1] = val1;
+            }
+            if (!sent_state_cache_.count(addr2) || sent_state_cache_[addr2] != val2) {
+                write_queue_.push({addr2, val2});
+                sent_state_cache_[addr2] = val2;
+            }
+            
+            // 3. 設定 2秒倒數，時間到後自動 OFF
+            reset_timer_.expires_after(std::chrono::seconds(2));
+            reset_timer_.async_wait([this, addr1, addr2](boost::system::error_code ec) {
+                
+                if (ec == boost::asio::error::operation_aborted) return; // 被新的訊號中斷
+
+                if (!ec) {
+                    // 4. ✅ [需求] 復歸 (OFF) 時，「不判斷狀態」，保證發送 0
+                    // 這樣比較安全，也可作為同步紀錄狀態的手段
+                    
+                    write_queue_.push({addr1, false});
+                    sent_state_cache_[addr1] = false; // 記得更新 Cache 為 false，下次變 true 才會發送
+
+                    write_queue_.push({addr2, false});
+                    sent_state_cache_[addr2] = false; 
+                    
+                    // spdlog::info("[PLC] Pulse Auto-Reset Done"); // Log 可選
+                }
+            });
         });
     }
 
@@ -79,6 +147,10 @@ private:
             if (!ec) {
                 spdlog::info("[PLC] Connected.");
                 connected_ = true;
+                
+                // ✅ [新增 4] 連線成功後，立刻執行安全復歸 (清除 M86, M87)
+                reset_safe_signals();
+
                 process_next_action(); 
             } else {
                 // 這裡不要用 handle_error，因為還沒連上
@@ -151,25 +223,40 @@ private:
         
         start_op_timeout(); // 啟動計時
 
-        boost::asio::async_write(socket_, boost::asio::buffer(*buf),
-            [this, buf](boost::system::error_code ec, std::size_t) {
-                if (!ec) {
-                    do_read_response();
-                } else {
-                    handle_error(ec);
-                }
-            });
+        boost::asio::async_write(socket_, boost::asio::buffer(*buf), [this, buf](boost::system::error_code ec, std::size_t) {
+            if (!ec) {
+                do_read_response();
+            } else {
+                handle_error(ec);
+            }
+        });
     }
 
     void do_read_response() {
         auto buf = std::make_shared<std::vector<uint8_t>>(1024);
-        socket_.async_read_some(boost::asio::buffer(*buf),
-            [this, buf](boost::system::error_code ec, std::size_t len) {
+        
+        // 計算預期收到的總長度
+        // Header (11 bytes) + Data ((數量 + 1) / 2)
+        int data_len = (read_count_ + 1) / 2; 
+        int expected_len = 11 + data_len;
+
+        // ✅ [修正 1] 改用 async_read 並指定 transfer_exactly，確保讀完完整封包
+        boost::asio::async_read(socket_, boost::asio::buffer(*buf), 
+            boost::asio::transfer_exactly(expected_len),
+            [this, buf, expected_len](boost::system::error_code ec, std::size_t len) {
+                
                 op_timer_.cancel(); // 操作完成，取消計時
 
                 if (!ec) {
-                    if (len > 11) { 
-                        std::vector<uint8_t> data(buf->begin() + 11, buf->begin() + len);
+                    // 檢查 End Code (Header 最後 2 bytes)
+                    int end_code = buf->at(9) | (buf->at(10) << 8);
+                    
+                    if (end_code != 0) {
+                        spdlog::error("[PLC] Read Error Code: {:04X}", end_code);
+                    }
+                    else if (len >= 11) { 
+                        // 擷取資料區段
+                        std::vector<uint8_t> data(buf->begin() + 11, buf->begin() + 11 + (len - 11));
                         bus_->push({"PLC", "STATUS", json{{"raw", data}, {"start_addr", start_addr_}}});
                     }
                     schedule_next_cycle(200);
@@ -224,13 +311,16 @@ private:
     std::vector<uint8_t> build_write_packet(int addr, bool on) {
         std::vector<uint8_t> packet = {
             0x50, 0x00, 0x00, 0xFF, 0xFF, 0x03, 0x00,
-            0x0D, 0x00, // ✅ [修正] 將 0x0C 改為 0x0D (13 bytes)
-            0x10, 0x00,
-            0x01, 0x14, 0x01, 0x00, 
+            0x0D, 0x00, // 長度 13 (正確)
+            0x10, 0x00, // Timer
+            0x01, 0x14, 0x01, 0x00, // Cmd: Batch Write (1401), Sub: Bit (0001)
             (uint8_t)(addr & 0xFF), (uint8_t)((addr >> 8) & 0xFF), 0x00,
-            0x90, 
-            0x01, 0x00, 
-            (uint8_t)(on ? 0x01 : 0x00) 
+            0x90, // Device M
+            0x01, 0x00, // Count 1
+            
+            // ✅ [修正] 
+            // MC Protocol 規定：第一個點位在 High Nibble (0x10)，而非 Low Nibble (0x01)
+            (uint8_t)(on ? 0x10 : 0x00) 
         };
         return packet;
     }

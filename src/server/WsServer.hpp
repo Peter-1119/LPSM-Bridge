@@ -71,8 +71,12 @@ public:
                     bus_->push({ "WS", "CMD", j });
                 } catch(...) {}
             },
-            .close = [](auto *ws, int code, std::string_view message) {
+            .close = [this](auto *ws, int code, std::string_view message) {
                 spdlog::info("[WS] Client disconnected");
+                
+                // ✅ [新增] 當前端斷線時，通知 Controller
+                // 這會觸發 Controller 去呼叫 PLC 的 reset_safe_signals
+                bus_->push({ "WS", "DISCONNECTED", json({}) });
             }
         }).listen("0.0.0.0", port, [port](auto *listen_socket) {
             if (listen_socket) spdlog::info("[WS] Server listening on port {}", port);
