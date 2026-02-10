@@ -28,7 +28,12 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     spdlog::info("[Scanner] Detected: {}", g_barcode_buffer);
                     
                     if (g_bus_ref) {
-                        if (g_barcode_buffer.compare("1") == 0) {
+                        if (g_barcode_buffer.compare("0") == 0) {
+                            spdlog::info("[Broadcast] Camera Test Input: TIMEOUT_BLANK");
+                            g_bus_ref->push({"CAMERA_LEFT_GROUP_MONITOR", "DATA", "TIMEOUT_BLANK"});
+                            g_bus_ref->push({"CAMERA_RIGHT_GROUP_MONITOR", "DATA", "TIMEOUT_BLANK"});
+                        }
+                        else if (g_barcode_buffer.compare("1") == 0) {
                             spdlog::info("[Broadcast] Camera Test Input: 4240912013144");
                             g_bus_ref->push({"CAMERA_LEFT_1", "DATA", "4240912013144"});
                         }
@@ -44,10 +49,17 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                             spdlog::info("[Broadcast] Camera Test Input: 4240914001156");
                             g_bus_ref->push({"CAMERA_RIGHT_2", "DATA", "4240914001156"});
                         }
-                        else if (g_barcode_buffer.compare("0") == 0) {
-                            spdlog::info("[Broadcast] Camera Test Input: TIMEOUT_BLANK");
-                            g_bus_ref->push({"CAMERA_LEFT_GROUP_MONITOR", "DATA", "TIMEOUT_BLANK"});
-                            g_bus_ref->push({"CAMERA_RIGHT_GROUP_MONITOR", "DATA", "TIMEOUT_BLANK"});
+                        else if (g_barcode_buffer.compare("5") == 0) {
+                            spdlog::info("[Broadcast] Camera Test Input: : 4251122021288");
+                            g_bus_ref->push({"CAMERA_LEFT_1", "DATA", "4251122021288"});
+                        }
+                        else if (g_barcode_buffer.compare("7") == 0) {
+                            spdlog::info("[Broadcast] Camera Test Input: : 9999999999996");
+                            g_bus_ref->push({"CAMERA_LEFT_1", "DATA", "9999999999996"});
+                        }
+                        else if (g_barcode_buffer.compare("6") == 0) {
+                            spdlog::info("[Broadcast] Keyboard Input: : Y04900132");
+                            g_bus_ref->push({"SCANNER", "DATA", "Y04900132"});
                         }
                         else {
                             spdlog::info("[Broadcast] Keyboard Input: {}", g_barcode_buffer);

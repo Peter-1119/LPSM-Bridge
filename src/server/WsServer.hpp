@@ -28,6 +28,7 @@ public:
             loop_->defer([this, msg = message]() {
                 if (app_ptr) {
                     app_ptr->publish("broadcast", msg, uWS::OpCode::TEXT, false);
+                    // spdlog::info("[WS] SEND Broadcast!!!");
                     spdlog::info("[WS] SEND Broadcast: {}", msg);
                 }
             });

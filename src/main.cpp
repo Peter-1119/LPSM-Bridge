@@ -81,8 +81,8 @@ int main() {
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
     // 2. 開啟網頁 (請確認現場是否連得到這個 IP)
-    // OpenEdgeOnWindows("http://10.8.32.64:2102/");
-    OpenEdgeOnWindows("http://localhost:5173/");
+    OpenEdgeOnWindows("http://10.8.32.64:2102/");
+    // OpenEdgeOnWindows("http://localhost:5173/");
     
     // 給瀏覽器足夠時間啟動，避免 Port 搶佔問題
     std::this_thread::sleep_for(std::chrono::milliseconds(3000));

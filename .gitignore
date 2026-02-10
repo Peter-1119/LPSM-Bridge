@@ -3,5 +3,4 @@ ControlHubScripts*.txt
 *.json
 
 build/
-DLLs/
 third_party/
